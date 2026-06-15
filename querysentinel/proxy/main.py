@@ -1,26 +1,19 @@
 """
-QuerySentinel — Proxy Entry Point
-====================================
-Wires the interceptor into the test app
-and starts logging all queries.
+QuerySentinel — Proxy Main (Week 1 Final)
+==========================================
+Runs all 5 query types through the interceptor.
+Port 5433 (your Windows-fixed port).
 
-Run this BEFORE starting the Flask test app.
-
-Usage:
-    python proxy/main.py
+Run: python proxy/main.py
 """
 
 import sys
 import os
-
-# Make sure imports work from project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import psycopg2
 from proxy.interceptor import InterceptedConnection
 from storage.writer import get_expensive_queries
-
-# ─── Config ───────────────────────────────────────────────────────────────────
 
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST", "localhost"),
@@ -30,100 +23,92 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", "querysentinel"),
 }
 
+QUERIES = [
+    (
+        "Simple SELECT [LOW cost]",
+        "SELECT id, name, email FROM users ORDER BY id LIMIT 20"
+    ),
+    (
+        "JOIN query [MEDIUM cost]",
+        """
+        SELECT o.id, u.name, p.name AS product, o.total, o.status
+        FROM orders o
+        JOIN users    u ON u.id = o.user_id
+        JOIN products p ON p.id = o.product_id
+        WHERE o.status != 'cancelled'
+        LIMIT 50
+        """
+    ),
+    (
+        "GROUP BY aggregation [MEDIUM-HIGH cost]",
+        """
+        SELECT p.category, COUNT(o.id) AS orders, SUM(o.total) AS revenue
+        FROM orders o
+        JOIN products p ON p.id = o.product_id
+        GROUP BY p.category
+        ORDER BY revenue DESC
+        """
+    ),
+    (
+        "Full table scan LIKE [HIGH cost]",
+        "SELECT * FROM products WHERE LOWER(name) LIKE '%product%'"
+    ),
+    (
+        "Correlated subquery [DANGER cost]",
+        """
+        SELECT u.id, u.name,
+            (SELECT COUNT(*) FROM orders o   WHERE o.user_id = u.id) AS orders,
+            (SELECT COUNT(*) FROM reviews r  WHERE r.user_id = u.id) AS reviews
+        FROM users u
+        LIMIT 30
+        """
+    ),
+]
 
-# ─── Demo: run all 5 query types through the interceptor ─────────────────────
 
 def run_demo():
-    """
-    Demonstrates QuerySentinel intercepting queries directly.
-    In production, the Flask app would use InterceptedConnection.
-    """
-    print("\n" + "="*60)
-    print("  QuerySentinel — Live Query Interception Demo")
-    print("="*60)
+    print("\n" + "="*62)
+    print("  QuerySentinel -- Proxy Demo (Week 1 Final)")
+    print("  Port: 5433")
+    print("="*62)
 
-    # Connect through the interceptor
-    real_conn  = psycopg2.connect(**DB_CONFIG)
-    log_conn   = psycopg2.connect(**DB_CONFIG)
-    intercepted = InterceptedConnection(real_conn, log_pool=log_conn)
-
-    queries = [
-        # (label, sql)
-        (
-            "Simple SELECT — expected LOW cost",
-            "SELECT id, name, email FROM users ORDER BY id LIMIT 20"
-        ),
-        (
-            "JOIN query — expected MEDIUM cost",
-            """
-            SELECT o.id, u.name, p.name AS product, o.total, o.status
-            FROM orders o
-            JOIN users    u ON u.id = o.user_id
-            JOIN products p ON p.id = o.product_id
-            WHERE o.status != 'cancelled'
-            LIMIT 50
-            """
-        ),
-        (
-            "GROUP BY aggregation — expected MEDIUM-HIGH cost",
-            """
-            SELECT p.category, COUNT(o.id) AS orders, SUM(o.total) AS revenue
-            FROM orders o
-            JOIN products p ON p.id = o.product_id
-            GROUP BY p.category
-            ORDER BY revenue DESC
-            """
-        ),
-        (
-            "Full table scan (LIKE) — expected HIGH cost",
-            "SELECT * FROM products WHERE LOWER(name) LIKE '%product%'"
-        ),
-        (
-            "Correlated subquery — expected DANGER cost",
-            """
-            SELECT u.id, u.name,
-                (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) AS orders,
-                (SELECT COUNT(*) FROM reviews r WHERE r.user_id = u.id) AS reviews
-            FROM users u
-            LIMIT 30
-            """
-        ),
-    ]
+    real_conn   = psycopg2.connect(**DB_CONFIG)
+    log_conn    = psycopg2.connect(**DB_CONFIG)  # separate connection for writes
+    intercepted = InterceptedConnection(real_conn, log_conn=log_conn)
 
     with intercepted:
         cur = intercepted.cursor()
-        for label, sql in queries:
-            print(f"\n\n>>> TEST: {label}")
+        for label, sql in QUERIES:
+            print(f"\n>>> {label}")
             cur.execute(sql)
             rows = cur.fetchall()
             print(f"    Returned {len(rows)} rows")
 
-    # ── Summary ───────────────────────────────────────────────
-    print("\n\n" + "="*60)
-    print("  DEMO COMPLETE")
-    print(f"  Total queries intercepted: {intercepted.intercepted_count}")
-    print("="*60)
+    print("\n\n" + "="*62)
+    print(f"  COMPLETE -- {intercepted.intercepted_count} queries intercepted")
+    print("="*62)
 
-    # Show most expensive queries from TimescaleDB
-    log_conn = psycopg2.connect(**DB_CONFIG)
-    expensive = get_expensive_queries(log_conn, limit=5)
-    log_conn.close()
+    # Show top expensive queries from DB
+    log_conn2 = psycopg2.connect(**DB_CONFIG)
+    expensive = get_expensive_queries(log_conn2, limit=5)
+    log_conn2.close()
 
     if expensive:
-        print("\n  TOP 5 MOST EXPENSIVE QUERIES LOGGED:")
-        print("  " + "-"*56)
+        print("\n  TOP 5 MOST EXPENSIVE QUERIES:")
+        print("  " + "-"*58)
         for i, q in enumerate(expensive, 1):
-            print(f"  {i}. Cost: {q['total_cost']:.1f} | "
-                  f"Node: {q['node_type']} | "
-                  f"Time: {q['exec_ms']:.1f}ms")
-            print(f"     SQL: {q['query_preview'][:70]}...")
-        print("  " + "-"*56)
-        print("\n  These are your Week 2 ML training targets !")
+            cost = float(q["total_cost"] or 0)
+            cat  = q.get("cost_category", "?")
+            node = q.get("node_type", "?")
+            ms   = float(q.get("exec_ms") or 0)
+            prev = str(q.get("query_preview", ""))[:65]
+            print(f"  {i}. [{cat}] Cost={cost:.1f} | Node={node} | {ms:.1f}ms")
+            print(f"     {prev}...")
 
-    print("\n  Open pgAdmin at http://localhost:8081")
-    print("  Email: admin@querysentinel.com  |  Password: admin")
-    print("  Run: SELECT * FROM query_logs ORDER BY total_cost DESC;")
-    print("="*60 + "\n")
+    print("\n  pgAdmin  : http://localhost:8080")
+    print("  Login    : admin@querysentinel.com / admin")
+    print("  Verify   : SELECT * FROM query_logs ORDER BY total_cost DESC;")
+    print("="*62 + "\n")
 
 
 if __name__ == "__main__":

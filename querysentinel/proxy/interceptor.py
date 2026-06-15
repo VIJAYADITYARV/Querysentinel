@@ -14,20 +14,16 @@ import time
 import sqlparse
 from datetime import datetime, timezone
 
-from explainer import explain_query
+from proxy.explainer import explain_query
 from storage.writer import save_query_log
 
 
 class InterceptedConnection:
-    """
-    Wraps a real psycopg2 connection.
-    Every .execute() call is intercepted, logged,
-    and run through EXPLAIN before proceeding.
-    """
+    """Wraps psycopg2 connection — every query goes through interception."""
 
-    def __init__(self, real_conn, log_pool=None):
-        self._conn = real_conn
-        self._log_pool = log_pool   # TimescaleDB pool (added day 4)
+    def __init__(self, real_conn, log_conn=None):
+        self._conn     = real_conn
+        self._log_conn = log_conn   # separate connection to write logs
         self.intercepted_count = 0
 
     def cursor(self, **kwargs):
@@ -63,38 +59,53 @@ class InterceptedCursor:
         self._parent = parent
 
     def execute(self, sql, params=None):
-        """Intercept every SQL call."""
-        start_time = time.perf_counter()
+        start = time.perf_counter()
 
-        # ── 1. Parse and clean the SQL ─────────────────────────
+        # 1. Clean the SQL for display
         clean_sql = self._clean_sql(sql, params)
 
-        # ── 2. Log to terminal ─────────────────────────────────
+        # 2. Increment counter and print header
         self._parent.intercepted_count += 1
-        print(f"\n{'-'*60}")
-        print(f"[INTERCEPTED #{self._parent.intercepted_count}] "
-              f"{datetime.now(timezone.utc).strftime('%H:%M:%S')}")
-        print(f"  SQL: {clean_sql[:120]}{'...' if len(clean_sql) > 120 else ''}")
+        n = self._parent.intercepted_count
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
-        # ── 3. Run the actual query ────────────────────────────
+        print(f"\n{'='*62}")
+        print(f"[INTERCEPTED #{n}] {ts}")
+        print(f"  SQL : {clean_sql[:110]}{'...' if len(clean_sql) > 110 else ''}")
+
+        # 3. Execute the real query
         self._cur.execute(sql, params)
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        elapsed_ms = (time.perf_counter() - start) * 1000
 
-        # ── 4. Run EXPLAIN ANALYZE (SELECT queries only) ───────
+        # 4. EXPLAIN ANALYZE on SELECT queries only
         explain_result = {}
         if self._is_select(clean_sql):
             try:
-                explain_result = explain_query(self._conn, clean_sql)
-                cost = explain_result.get("total_cost", "?")
-                node = explain_result.get("node_type", "?")
-                rows = explain_result.get("actual_rows", "?")
+                explain_result = explain_query(self._conn, clean_sql, params)
 
-                print(f"  COST: {cost:.2f}  |  NODE: {node}  |  ROWS: {rows}")
-                print(f"  TIME: {elapsed_ms:.2f}ms")
+                cost     = explain_result.get("total_cost")    or 0.0
+                node     = explain_result.get("node_type")     or "?"
+                rows     = explain_result.get("actual_rows")   or 0
+                danger   = explain_result.get("danger_score")  or 0.0
+                category = explain_result.get("cost_category") or "?"
 
-                # Flag expensive queries immediately
-                if explain_result.get("total_cost", 0) > 500:
-                    print(f"  [WARNING] HIGH COST QUERY - QuerySentinel will flag this")
+                print(f"  COST    : {cost:.2f}  ({category})")
+                print(f"  NODE    : {node}")
+                print(f"  ROWS    : {rows}")
+                print(f"  DANGER  : {danger:.2f}")
+                print(f"  TIME    : {elapsed_ms:.2f}ms")
+
+                # Flags
+                flags = []
+                if explain_result.get("has_seq_scan"):    flags.append("SEQ_SCAN")
+                if explain_result.get("has_nested_loop"): flags.append("NESTED_LOOP")
+                if explain_result.get("subquery_count", 0) > 2:
+                    flags.append("CORRELATED_SUBQUERY")
+                if flags:
+                    print(f"  FLAGS   : {', '.join(flags)}")
+
+                if category in ("HIGH", "DANGER"):
+                    print(f"  [WARNING] {category} COST QUERY - QuerySentinel flags this")
 
             except Exception as e:
                 print(f"  [EXPLAIN ERROR] {e}")
@@ -107,12 +118,13 @@ class InterceptedCursor:
             "captured_at": datetime.now(timezone.utc),
         }
 
-        if self._parent._log_pool:
-            try:
-                save_query_log(self._parent._log_pool, log_entry)
+        log_conn = self._parent._log_conn or self._conn
+        try:
+            saved = save_query_log(log_conn, log_entry)
+            if saved:
                 print(f"  [SUCCESS] Logged to TimescaleDB")
-            except Exception as e:
-                print(f"  [LOG ERROR] {e}")
+        except Exception as e:
+            print(f"  [LOG ERROR] {e}")
 
         print(f"{'-'*60}")
         return self

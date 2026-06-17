@@ -1,0 +1,15 @@
+artifact_uri: file:D:/Onedrive/QuerySentinal/querysentinel/mlruns/241684886867417292/e46656b9015245b7a2692cd68bda6c6a/artifacts
+end_time: 1781724626836
+entry_point_name: ''
+experiment_id: '241684886867417292'
+lifecycle_stage: active
+run_id: e46656b9015245b7a2692cd68bda6c6a
+run_name: GradientBoosting
+run_uuid: e46656b9015245b7a2692cd68bda6c6a
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1781724615908
+status: 3
+tags: []
+user_id: vijay

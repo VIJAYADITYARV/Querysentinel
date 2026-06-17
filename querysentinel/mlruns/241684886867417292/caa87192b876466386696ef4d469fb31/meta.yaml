@@ -1,0 +1,15 @@
+artifact_uri: file:D:/Onedrive/QuerySentinal/querysentinel/mlruns/241684886867417292/caa87192b876466386696ef4d469fb31/artifacts
+end_time: 1781724615887
+entry_point_name: ''
+experiment_id: '241684886867417292'
+lifecycle_stage: active
+run_id: caa87192b876466386696ef4d469fb31
+run_name: RandomForest
+run_uuid: caa87192b876466386696ef4d469fb31
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1781724594762
+status: 3
+tags: []
+user_id: vijay

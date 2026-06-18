@@ -1,17 +1,20 @@
 """
-QuerySentinel — ML Cost Predictor (Week 2)
-============================================
+QuerySentinel — ML Cost Predictor (Week 2 + confidence escalation patch)
+===========================================================================
 Loads the trained model and predicts query cost
 category from SQL text BEFORE the query executes.
 
-This is the core Week 2 feature:
-  Week 1: detect expensive queries AFTER they ran
-  Week 2: predict expensive queries BEFORE they run
+PATCH: Confidence-threshold escalation.
+With a small training set, the model can be uncertain
+on rare patterns (e.g. correlated subqueries). Rather than
+trusting a low-confidence point estimate, we escalate
+uncertain HIGH predictions to DANGER for safety.
+
+Rule: if predicted category is HIGH AND confidence < 60%,
+      escalate to DANGER (safer to over-flag than under-flag).
 
 Usage (standalone test):
     python ml/predictor.py
-
-Used by proxy/interceptor.py automatically.
 """
 
 import os
@@ -45,12 +48,19 @@ DANGER_LEVEL = {
     "DANGER": 3,
 }
 
+# ── Confidence escalation threshold ────────────────────────────────────────
+# If model predicts HIGH but confidence is below this, escalate to DANGER.
+# Rationale: safer to over-flag an uncertain query than let a potentially
+# dangerous query through on a low-confidence guess.
+LOW_CONFIDENCE_THRESHOLD = 0.60
+
 
 class QueryCostPredictor:
     """
     Predicts query cost category from SQL text alone.
     Loads trained model from ml/model.pkl.
     Falls back to heuristic if model not found.
+    Applies confidence-threshold escalation as a safety net.
     """
 
     def __init__(self):
@@ -87,41 +97,65 @@ class QueryCostPredictor:
 
         Returns:
             dict with:
-              predicted_category: LOW / MEDIUM / HIGH / DANGER
+              predicted_category: LOW / MEDIUM / HIGH / DANGER (after escalation)
+              raw_predicted_category: the model's original prediction (before escalation)
               confidence:         0.0 – 1.0
               action:             ALLOW / FLAG / BLOCK_AND_REWRITE
+              escalated:          True if confidence escalation changed the result
               features:           extracted feature dict
               method:             'ml_model' or 'heuristic'
         """
-        # Extract features from SQL text
         features = extract_features(sql)
 
         if self.model_loaded:
-            return self._predict_with_model(sql, features)
+            result = self._predict_with_model(sql, features)
         else:
-            return self._predict_heuristic(sql, features)
+            result = self._predict_heuristic(sql, features)
+
+        return self._apply_confidence_escalation(result)
+
+    def _apply_confidence_escalation(self, result: dict) -> dict:
+        """
+        Safety net: if the model predicts HIGH with low confidence,
+        escalate to DANGER. An uncertain "maybe expensive" guess
+        should be treated as "assume the worst" rather than "allow it."
+        """
+        category   = result["predicted_category"]
+        confidence = result["confidence"]
+
+        result["raw_predicted_category"] = category
+        result["escalated"] = False
+
+        if category == "HIGH" and confidence < LOW_CONFIDENCE_THRESHOLD:
+            result["predicted_category"] = "DANGER"
+            result["action"]             = ACTIONS["DANGER"]
+            result["danger_level"]       = DANGER_LEVEL["DANGER"]
+            result["escalated"]          = True
+            result["escalation_reason"]  = (
+                f"Predicted HIGH at {confidence:.0%} confidence "
+                f"(below {LOW_CONFIDENCE_THRESHOLD:.0%} threshold) "
+                f"— escalated to DANGER for safety"
+            )
+
+        return result
 
     def _predict_with_model(self, sql: str, features: dict) -> dict:
         """Use trained ML model for prediction."""
         try:
-            # Build feature vector in the order the model expects
             X = []
             for col in self.feature_cols:
-                # Map CSV column names to feature extractor output
                 val = features.get(col, 0)
                 X.append(float(val) if val is not None else 0.0)
 
-            # Predict
             pred_encoded = self.model.predict([X])[0]
             category     = self.label_encoder.inverse_transform([pred_encoded])[0]
 
-            # Get probability if available
             confidence = 0.0
             if hasattr(self.model, "predict_proba"):
                 proba      = self.model.predict_proba([X])[0]
                 confidence = round(float(max(proba)), 3)
             elif hasattr(self.model, "decision_function"):
-                confidence = 0.75  # default for models without proba
+                confidence = 0.75
 
             return {
                 "predicted_category": category,
@@ -137,10 +171,7 @@ class QueryCostPredictor:
             return self._predict_heuristic(sql, features)
 
     def _predict_heuristic(self, sql: str, features: dict) -> dict:
-        """
-        Rule-based fallback when model not available.
-        Used before training or if model file missing.
-        """
+        """Rule-based fallback when model not available."""
         score = features.get("complexity_score", 0)
         subs  = features.get("subquery_count",   0)
         wild  = features.get("has_leading_wild",  0)
@@ -157,7 +188,7 @@ class QueryCostPredictor:
 
         return {
             "predicted_category": category,
-            "confidence":         0.6,   # heuristic confidence
+            "confidence":         0.6,
             "action":             ACTIONS.get(category, "FLAG"),
             "danger_level":       DANGER_LEVEL.get(category, 0),
             "features":           features,
@@ -165,21 +196,18 @@ class QueryCostPredictor:
         }
 
     def is_dangerous(self, sql: str) -> bool:
-        """Quick check — is this query predicted DANGER?"""
         result = self.predict(sql)
         return result["predicted_category"] == "DANGER"
 
     def should_flag(self, sql: str) -> bool:
-        """Should this query be flagged (HIGH or DANGER)?"""
         result = self.predict(sql)
         return result["danger_level"] >= 2
 
 
-# ── Singleton instance — loaded once, reused by proxy ─────────────────────────
+# ── Singleton instance ─────────────────────────────────────────────────────────
 _predictor_instance = None
 
 def get_predictor() -> QueryCostPredictor:
-    """Get singleton predictor instance."""
     global _predictor_instance
     if _predictor_instance is None:
         _predictor_instance = QueryCostPredictor()
@@ -220,16 +248,17 @@ if __name__ == "__main__":
     ]
 
     print("\n" + "="*65)
-    print("  QuerySentinel — ML Predictor Test")
-    print("  Predicting cost BEFORE query executes")
+    print("  QuerySentinel — ML Predictor Test (with confidence escalation)")
     print("="*65)
 
     for label, sql in test_queries:
         result = predictor.predict(sql)
-        cat    = result["predicted_category"]
-        conf   = result["confidence"]
-        action = result["action"]
-        method = result["method"]
+        cat     = result["predicted_category"]
+        raw_cat = result["raw_predicted_category"]
+        conf    = result["confidence"]
+        action  = result["action"]
+        method  = result["method"]
+        escalated = result["escalated"]
 
         icon = {
             "LOW":    "[OK]    ",
@@ -239,12 +268,14 @@ if __name__ == "__main__":
         }.get(cat, "[?]     ")
 
         print(f"\n  {icon} {label}")
-        print(f"    Category   : {cat}")
-        print(f"    Confidence : {conf:.0%}")
-        print(f"    Action     : {action}")
-        print(f"    Method     : {method}")
+        print(f"    Raw prediction : {raw_cat} ({conf:.0%} confidence)")
+        print(f"    Final category : {cat}")
+        if escalated:
+            print(f"    [ESCALATED]    : {result['escalation_reason']}")
+        print(f"    Action         : {action}")
+        print(f"    Method         : {method}")
 
     print("\n" + "="*65)
     print("  Predictor test complete.")
-    print("  Next: this predictor is now wired into the proxy.")
+    print("  Confidence escalation active: HIGH @ <60% conf -> DANGER")
     print("="*65 + "\n")

@@ -1,0 +1,7 @@
+# Week 3 additions — add these to your existing requirements.txt
+# (langchain, langgraph, openai, python-dotenv were already listed
+#  in your Week 1 requirements.txt, this confirms versions)
+
+langgraph==0.0.26
+openai==1.10.0
+python-dotenv==1.0.0

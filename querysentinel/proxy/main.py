@@ -1,25 +1,29 @@
 """
-QuerySentinel — Proxy Demo v2 (Week 2)
-========================================
-Demonstrates ML prediction BEFORE query execution.
-Shows DANGER queries being blocked automatically.
+QuerySentinel — Proxy Demo v3 (Week 3)
+=========================================
+The full autonomous loop in action:
+  DANGER query -> LLM agent rewrites -> validates -> executes fixed version
 
-Run: python proxy/main_v2.py
+Run: python proxy/main_v3.py
 
-Expected output:
-  [ML PREDICT] LOW    (confidence: 85%) | action: ALLOW
-  [ML PREDICT] MEDIUM (confidence: 72%) | action: ALLOW
-  [ML PREDICT] HIGH   (confidence: 68%) | action: FLAG
-  [ML PREDICT] DANGER (confidence: 91%) | action: BLOCK_AND_REWRITE
-  [BLOCKED] DANGER query stopped by QuerySentinel
+Requires: GEMINI_API_KEY set in environment.
+    Windows PowerShell:  $env:GEMINI_API_KEY = "AIza..."
+    Or use a .env file with python-dotenv (see bottom of file)
 """
 
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Load .env file if present (optional convenience)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import psycopg2
-from proxy.interceptor import InterceptedConnection, DangerousQueryError
+from proxy.interceptor import InterceptedConnection, EscalatedQueryError
 from storage.writer import get_expensive_queries
 
 DB_CONFIG = {
@@ -32,7 +36,7 @@ DB_CONFIG = {
 
 QUERIES = [
     {
-        "label": "Simple SELECT [expected: LOW -> ALLOW]",
+        "label": "Simple SELECT [expected: LOW -> ALLOW, no agent needed]",
         "sql": "SELECT id, name, email FROM users ORDER BY id LIMIT 20",
     },
     {
@@ -47,26 +51,11 @@ QUERIES = [
         """,
     },
     {
-        "label": "GROUP BY aggregation [expected: MEDIUM/HIGH -> FLAG]",
-        "sql": """
-            SELECT p.category, COUNT(o.id) AS orders, SUM(o.total) AS revenue
-            FROM orders o
-            JOIN products p ON p.id = o.product_id
-            GROUP BY p.category
-            ORDER BY revenue DESC
-        """,
-    },
-    {
-        "label": "Full table scan LIKE [expected: HIGH -> FLAG]",
-        "sql": "SELECT * FROM products WHERE LOWER(name) LIKE '%product%'",
-    },
-    {
-        "label": "Correlated subquery [expected: DANGER -> BLOCK]",
+        "label": "Correlated subquery [expected: DANGER -> AGENT REWRITES]",
         "sql": """
             SELECT u.id, u.name,
                 (SELECT COUNT(*) FROM orders  o WHERE o.user_id = u.id) AS orders,
-                (SELECT COUNT(*) FROM reviews r WHERE r.user_id = u.id) AS reviews,
-                (SELECT AVG(r2.rating) FROM reviews r2 WHERE r2.user_id = u.id) AS avg_rating
+                (SELECT COUNT(*) FROM reviews r WHERE r.user_id = u.id) AS reviews
             FROM users u LIMIT 30
         """,
     },
@@ -74,24 +63,25 @@ QUERIES = [
 
 
 def run_demo():
+    if not os.getenv("GEMINI_API_KEY"):
+        print("\n[ERROR] GEMINI_API_KEY not set.")
+        print("  Set it with: $env:GEMINI_API_KEY = 'AIza...'  (PowerShell)")
+        print("  Or create a .env file with: GEMINI_API_KEY=AIza...")
+        return
+
     print("\n" + "="*65)
-    print("  QuerySentinel v2 -- ML Prediction BEFORE Execution")
-    print("  Week 2 Demo")
+    print("  QuerySentinel v3 -- Autonomous Detect + Rewrite + Execute")
+    print("  Week 3 Demo")
     print("="*65)
 
     real_conn = psycopg2.connect(**DB_CONFIG)
     log_conn  = psycopg2.connect(**DB_CONFIG)
 
-    # block_danger=True means DANGER queries are stopped before they run
     intercepted = InterceptedConnection(
         real_conn,
         log_conn=log_conn,
-        block_danger=True,
+        auto_rewrite=True,    # Week 3: rewrite instead of blocking
     )
-
-    allowed  = 0
-    flagged  = 0
-    blocked  = 0
 
     with intercepted:
         cur = intercepted.cursor()
@@ -102,44 +92,21 @@ def run_demo():
                 cur.execute(q["sql"])
                 rows = cur.fetchall()
                 print(f"    Returned {len(rows)} rows")
-                allowed += 1
-            except DangerousQueryError as e:
-                print(f"    [BLOCKED] Query was stopped: {str(e)[:80]}")
-                blocked += 1
+            except EscalatedQueryError as e:
+                print(f"    [ESCALATED] {str(e)[:100]}")
             except Exception as e:
                 print(f"    [ERROR] {e}")
 
-    # ── Final summary ─────────────────────────────────────────
     print("\n\n" + "="*65)
-    print("  WEEK 2 DEMO COMPLETE")
+    print("  WEEK 3 DEMO COMPLETE")
     print("="*65)
-    print(f"  Queries allowed  : {allowed}")
-    print(f"  Queries flagged  : {intercepted.flagged_count}")
-    print(f"  Queries BLOCKED  : {intercepted.blocked_count}")
-    print(f"\n  This is QuerySentinel's core value:")
-    print(f"  Expensive queries are stopped BEFORE they hit the DB.")
-    print(f"  Week 3: LLM agent rewrites blocked queries automatically.")
-
-    # Show prediction accuracy from logs
-    log_conn2 = psycopg2.connect(**DB_CONFIG)
-    try:
-        with log_conn2.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    COUNT(*)                                     AS total,
-                    SUM(CASE WHEN node_type = 'BLOCKED' THEN 1 ELSE 0 END) AS blocked
-                FROM query_logs
-            """)
-            row = cur.fetchone()
-            print(f"\n  Total queries in log : {row[0]}")
-            print(f"  Blocked queries      : {row[1]}")
-    except Exception as e:
-        print(f"  [LOG CHECK] {e}")
-    finally:
-        log_conn2.close()
-
-    print("\n  Open MLflow: mlflow ui --port 5001")
-    print("  Open pgAdmin: http://localhost:8080")
+    print(f"\n  This is the full QuerySentinel value proposition:")
+    print(f"  - Detects dangerous queries before they hit the DB")
+    print(f"  - An LLM agent automatically rewrites them")
+    print(f"  - Every rewrite is VALIDATED with EXPLAIN before trusting it")
+    print(f"  - Only safe, faster queries actually execute")
+    print(f"\n  Open pgAdmin: http://localhost:8080")
+    print(f"  Check query_logs for was_rewritten=true rows")
     print("="*65 + "\n")
 
 

@@ -26,9 +26,6 @@ FIX:
   optimal* (not because the rewrite failed), classify this as
   ACCEPT_NO_CHANGE rather than ESCALATE — it's a different,
   non-alarming outcome.
-
-Uses: Google Gemini API (gemini-2.5-flash)
-Requires: GEMINI_API_KEY environment variable
 """
 
 import os
@@ -36,17 +33,11 @@ import sys
 import json
 import re
 from typing import TypedDict, Optional
-from dotenv import load_dotenv
-
-load_dotenv()
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langgraph.graph import StateGraph, END
-import google.generativeai as genai
-
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-GEMINI_MODEL = "gemini-2.5-flash"
+from openai import OpenAI
 
 from schema.introspector import get_schema_context, schema_to_prompt_string
 from proxy.explainer import explain_query
@@ -70,8 +61,6 @@ IMPROVEMENT_THRESHOLD = 0.30
 # false alarm AND saves an unnecessary LLM call.
 LOW_COST_FLOOR = 10.0
 
-
-# ─── Agent State ────────────────────────────────────────────────────────────
 
 class AgentState(TypedDict):
     original_sql:       str
@@ -116,14 +105,9 @@ def route_after_floor_check(state: AgentState) -> str:
     return "diagnose"
 
 
-# ─── Node 1: Diagnose ───────────────────────────────────────────────────────
+# ─── Node 1: Diagnose (unchanged) ────────────────────────────────────────────
 
 def diagnose_node(state: AgentState) -> AgentState:
-    """
-    Reasoning step: WHY is this query slow?
-    Uses the EXPLAIN plan + schema to build a diagnosis
-    that gets fed into the rewrite prompt.
-    """
     print(f"\n[AGENT] Diagnosing query (attempt {state['attempt'] + 1})...")
 
     explain = state["original_explain"]
@@ -151,17 +135,14 @@ def diagnose_node(state: AgentState) -> AgentState:
     return state
 
 
-# ─── Node 2: Rewrite (Gemini) ───────────────────────────────────────────────
+# ─── Node 2: Rewrite (unchanged) ─────────────────────────────────────────────
 
 def rewrite_node(state: AgentState) -> AgentState:
-    """
-    LLM call: given the original SQL, diagnosis, and schema,
-    propose a faster equivalent query. Uses Google Gemini.
-    """
     print(f"[AGENT] Calling LLM to rewrite query...")
 
-    try:
-        prompt = f"""You are a senior PostgreSQL database engineer. A query has been
+    client = OpenAI()
+
+    prompt = f"""You are a senior PostgreSQL database engineer. A query has been
 flagged as DANGEROUSLY EXPENSIVE and blocked from running. Your job is to
 rewrite it into a FUNCTIONALLY EQUIVALENT but FASTER query.
 
@@ -188,19 +169,20 @@ Respond in this EXACT JSON format, nothing else:
 }}
 """
 
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        response = model.generate_content(prompt)
-        if response.candidates:
-            print(f"[DEBUG] Finish reason: {response.candidates[0].finish_reason}")
-        raw_text = response.text.strip()
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=600,
+        )
 
-        # Remove potential markdown formatting
+        raw_text = response.choices[0].message.content.strip()
         raw_text = re.sub(r'^```json\s*|\s*```$', '', raw_text, flags=re.MULTILINE).strip()
-        print(f"[DEBUG] Raw LLM Response: {raw_text}")
 
-        data = json.loads(raw_text, strict=False)
-        rewritten_sql = data.get("rewritten_sql", state['original_sql'])
-        explanation = data.get("explanation", "No explanation provided by LLM.")
+        parsed = json.loads(raw_text)
+        rewritten_sql = parsed["rewritten_sql"].strip()
+        explanation   = parsed["explanation"].strip()
 
         print(f"[AGENT] Rewrite proposed: {explanation}")
         print(f"[AGENT] New SQL: {rewritten_sql[:120]}...")
@@ -216,7 +198,7 @@ Respond in this EXACT JSON format, nothing else:
     return state
 
 
-# ─── Node 3: Validate (FIXED) ───────────────────────────────────────────────
+# ─── Node 3: Validate (FIXED) ────────────────────────────────────────────────
 
 def validate_node(state: AgentState) -> AgentState:
     """
@@ -296,10 +278,6 @@ def validate_node(state: AgentState) -> AgentState:
 # ─── Node 4: Report (updated to handle ACCEPT_NO_CHANGE) ─────────────────────
 
 def report_node(state: AgentState) -> AgentState:
-    """
-    Final node: write a plain-English incident report
-    summarising what happened, regardless of outcome.
-    """
     decision = state["decision"]
 
     if decision == "ACCEPT":
@@ -343,14 +321,12 @@ def report_node(state: AgentState) -> AgentState:
 # ─── Routing logic ──────────────────────────────────────────────────────────
 
 def route_after_validation(state: AgentState) -> str:
-    """Decide which node to go to next based on validation decision."""
     if state["decision"] == "RETRY" and state["attempt"] < MAX_REWRITE_ATTEMPTS - 1:
         return "retry"
     return "report"
 
 
 def increment_attempt_node(state: AgentState) -> AgentState:
-    """Bump attempt counter before retrying."""
     state["attempt"] += 1
     return state
 
@@ -398,25 +374,15 @@ def build_rewrite_agent():
             "report": "report",
         }
     )
-    graph.add_edge("increment", "diagnose")   # loop back with new attempt
+    graph.add_edge("increment", "diagnose")
     graph.add_edge("report", END)
 
     return graph.compile()
 
 
-# ─── Public interface used by the proxy ────────────────────────────────────
+# ─── Public interface used by the proxy (unchanged signature) ───────────────
 
 def rewrite_dangerous_query(sql: str, explain_result: dict) -> dict:
-    """
-    Main entry point called by the proxy when a DANGER query is blocked.
-
-    Args:
-        sql:            the original SQL that was blocked
-        explain_result: the EXPLAIN output that triggered the block
-
-    Returns:
-        dict with decision, rewritten_sql (if accepted), and incident_report
-    """
     schema = get_schema_context()
     schema_str = schema_to_prompt_string(schema)
 

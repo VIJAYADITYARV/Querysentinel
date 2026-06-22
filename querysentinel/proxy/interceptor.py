@@ -124,6 +124,11 @@ class InterceptedCursor:
                             self._parent.rewritten_count += 1
                             print(f"  [AGENT ACCEPT] Using rewritten query instead")
                             print(f"  [AGENT REASON] {agent_result['decision_reasoning']}")
+                        elif decision == "ACCEPT_NO_CHANGE":
+                            # Query is already optimal — run as-is, no false alarm
+                            sql_to_execute = clean_sql
+                            print(f"  [AGENT OK] Query already optimal — no rewrite needed")
+                            print(f"  [AGENT REASON] {agent_result['decision_reasoning']}")
                         else:
                             self._parent.escalated_count += 1
                             print(f"  [AGENT ESCALATE] Could not safely rewrite query")

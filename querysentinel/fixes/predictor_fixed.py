@@ -103,7 +103,6 @@ class QueryCostPredictor:
 
             self.model_loaded = True
             print(f"[PREDICTOR] Model loaded from {MODEL_PATH}")
-            print(f"[PREDICTOR] Features: {self.feature_cols}")
 
         except Exception as e:
             print(f"[PREDICTOR] Failed to load model: {e} — using heuristic")
